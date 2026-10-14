@@ -1,0 +1,40 @@
+name: BAR B 営業中ストーリー
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "create=制作・予約 / verify=公開確認 / selftest=接続テスト"
+        required: true
+        default: selftest
+        type: choice
+        options: [selftest, create, verify]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: barb-story
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 日本語フォント
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+      - name: ライブラリ
+        run: pip install -r requirements.txt
+      - name: 実行
+        env:
+          METRICOOL_TOKEN: ${{ secrets.METRICOOL_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python "barb story.py" ${{ inputs.mode }}
