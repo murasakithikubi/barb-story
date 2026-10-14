@@ -1,0 +1,90 @@
+[
+ {
+  "file": "1_classic.png",
+  "theme": "Neon & Cyberpunk",
+  "copy": "今夜の主役は、あなた色に染まる。",
+  "design": {
+   "layout": "classic",
+   "fontset": "gothic",
+   "accent_name": "neon_cyan"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "2_left_editorial.png",
+  "theme": "Neon & Cyberpunk",
+  "copy": "今夜の主役は、あなた色に染まる。",
+  "design": {
+   "layout": "left_editorial",
+   "fontset": "gothic_soft",
+   "accent_name": "gold"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "3_center_card.png",
+  "theme": "Warm & Vintage",
+  "copy": "マイクを握れば、世界が変わる。",
+  "design": {
+   "layout": "center_card",
+   "fontset": "gothic",
+   "accent_name": "neon_cyan"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "4_frame.png",
+  "theme": "Warm & Vintage",
+  "copy": "マイクを握れば、世界が変わる。",
+  "design": {
+   "layout": "frame",
+   "fontset": "mincho",
+   "accent_name": "gold"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "5_neon.png",
+  "theme": "Minimal & Moody",
+  "copy": "歌声が響く、秘密の隠れ家へ。",
+  "design": {
+   "layout": "neon",
+   "fontset": "gothic",
+   "accent_name": "neon_cyan"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "6_band.png",
+  "theme": "Minimal & Moody",
+  "copy": "歌声が響く、秘密の隠れ家へ。",
+  "design": {
+   "layout": "band",
+   "fontset": "gothic_soft",
+   "accent_name": "neon_pink"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "7_vertical_title.png",
+  "theme": "Party & Luminous",
+  "copy": "最高の夜が、ここからはじまる。",
+  "design": {
+   "layout": "vertical_title",
+   "fontset": "mincho_light",
+   "accent_name": "white"
+  },
+  "check": "合格"
+ },
+ {
+  "file": "8_split.png",
+  "theme": "Party & Luminous",
+  "copy": "最高の夜が、ここからはじまる。",
+  "design": {
+   "layout": "split",
+   "fontset": "gothic",
+   "accent_name": "neon_pink"
+  },
+  "check": "合格"
+ }
+]
