@@ -20,6 +20,7 @@ import requests
 import base64
 import time
 import json
+import re
 import subprocess
 from pathlib import Path
 import hashlib
@@ -628,9 +629,17 @@ def generate(prompt: str, retries=3) -> Image.Image:
 
 # ======================================================================
 # Gemini API(テーマ判断・一言コピー作成・画像の判定)。
+# 無料枠は1モデルあたり1日の回数が少ないため、
+#  1. 呼び出し回数を減らす(画像の判定・審査はまとめて1回)
+#  2. 上限に達したら、使える別の無料Flashモデルへ自動で切り替える
 # 返答はJSON形式で受け取り、必要な項目がそろっているかをプログラムで検査する。
 # 
 
+
+API = "https://generativelanguage.googleapis.com/v1beta"
+_EXHAUSTED = set()   # この実行中に1日の上限に達したモデル
+_MODELS = None
+CALLS = {"count": 0, "by_model": {}}
 
 
 class GeminiError(RuntimeError):
@@ -645,43 +654,98 @@ def _img_part(img: Image.Image, max_side=768):
     return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode()}}
 
 
-def ask_json(prompt: str, images=(), required_keys=(), retries=4) -> dict:
+def models() -> list[str]:
+    """使える無料Flash系モデルの一覧(優先順)。設定したモデルを先頭にする。"""
+    global _MODELS
+    if _MODELS is not None:
+        return _MODELS
+    names = []
+    try:
+        r = requests.get(f"{API}/models", params={"key": GEMINI_API_KEY, "pageSize": 200}, timeout=30)
+        for m in r.json().get("models", []):
+            n = m["name"].split("/", 1)[-1]
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if "flash" not in n or any(x in n for x in ("image", "tts", "live", "audio", "embedding", "transcribe", "omni")):
+                continue
+            names.append(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+    def key(n):
+        nums = [int(x) for x in re.findall(r"\d+", n.split("-")[1] if "-" in n else "0")] or [0]
+        preview = "preview" in n or "exp" in n
+        return (preview, "lite" in n, [-x for x in nums], n)
+
+    names.sort(key=key)
+    first = [GEMINI_MODEL] if GEMINI_MODEL else []
+    _MODELS = first + [n for n in names if n not in first] + [n for n in ("gemini-flash-latest", "gemini-flash-lite-latest") if n not in names and n not in first]
+    return _MODELS
+
+
+def _retry_delay(text: str) -> float:
+    m = re.search(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"', text)
+    return float(m.group(1)) if m else 20.0
+
+
+def ask_json(prompt: str, images=(), required_keys=(), temperature=0.9) -> dict:
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY が設定されていません")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     parts = [{"text": prompt}] + [_img_part(i) for i in images]
     body = {"contents": [{"parts": parts}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
-    last = None
-    for i in range(retries):
-        try:
-            r = requests.post(url, params={"key": GEMINI_API_KEY}, json=body, timeout=120)
-        except requests.RequestException as e:
-            last = str(e)
-            time.sleep(8 * (i + 1))
+            "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
+    errors = []
+    for model in models():
+        if model in _EXHAUSTED:
             continue
-        if r.status_code != 200:
-            last = f"HTTP {r.status_code}: {r.text[:300]}"
-            if r.status_code in (400, 401, 403):
-                break
-            time.sleep(15 * (i + 1))
-            continue
-        try:
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            data = json.loads(text)
-        except (KeyError, IndexError, ValueError) as e:
-            last = f"JSONとして読めない応答: {e}"
-            continue
-        missing = [k for k in required_keys if k not in data or data[k] is None or data[k] == ""]
-        if missing:
-            last = f"必須項目の欠落: {missing}"
-            continue  # 抜けがあれば作り直させる
-        return data
-    raise GeminiError(f"Geminiの応答取得に失敗: {last}")
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{API}/models/{model}:generateContent", params={"key": GEMINI_API_KEY},
+                                  json=body, timeout=180)
+            except requests.RequestException as e:
+                errors.append(f"{model}: 通信エラー {e}")
+                time.sleep(10)
+                continue
+            CALLS["count"] += 1
+            CALLS["by_model"][model] = CALLS["by_model"].get(model, 0) + 1
+            if r.status_code == 429:
+                t = r.text
+                if "PerDay" in t or "per day" in t.lower() or "limit: 0" in t:
+                    _EXHAUSTED.add(model)
+                    errors.append(f"{model}: 1日の無料上限に到達")
+                    break  # 次のモデルへ
+                wait = min(_retry_delay(t) + 2, 65)
+                errors.append(f"{model}: 1分あたりの上限。{wait:.0f}秒待って再試行")
+                time.sleep(wait)
+                continue
+            if r.status_code in (400, 403, 404):
+                errors.append(f"{model}: HTTP {r.status_code} {r.text[:200]}")
+                if r.status_code == 403 and "API_KEY" in r.text:
+                    raise GeminiError("GeminiのAPIキーが無効です: " + r.text[:300])
+                break  # このモデルは使えない
+            if r.status_code != 200:
+                errors.append(f"{model}: HTTP {r.status_code} {r.text[:200]}")
+                time.sleep(10)
+                continue
+            try:
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(text)
+            except (KeyError, IndexError, ValueError) as e:
+                errors.append(f"{model}: JSONとして読めない応答 {e}")
+                continue
+            if isinstance(data, dict):
+                missing = [k for k in required_keys if k not in data or data[k] is None or data[k] == ""]
+                if missing:
+                    errors.append(f"{model}: 必須項目の欠落 {missing}")
+                    continue  # 抜けがあれば作り直させる
+            data_model = data if isinstance(data, dict) else {"items": data}
+            data_model.setdefault("_model", model)
+            return data_model
+    raise GeminiError("Geminiの応答を取得できませんでした:\n" + "\n".join(errors[-8:]))
 
 
 def plan_story(the_date, past: list[dict], avoid_notes: list[str]) -> dict:
-    """その日のテーマ・背景画像の指示・一言コピーを決める。"""
+    """その日のテーマ・背景画像の指示・一言コピーを決める。(1回の呼び出し)"""
     history = "\n".join(f"- テーマ: {p.get('theme','')} / 一言: {p.get('copy','')} / 画像: {p.get('description','')}"
                         for p in past[-60:]) or "(なし)"
     avoid = "\n".join(f"- {n}" for n in avoid_notes) or "(なし)"
@@ -710,34 +774,55 @@ def plan_story(the_date, past: list[dict], avoid_notes: list[str]) -> dict:
     return ask_json(prompt, required_keys=("theme", "subject", "composition", "background", "palette", "image_prompt", "copy"))
 
 
-def is_open_notice(img: Image.Image) -> dict:
-    """過去ストーリーが「営業中！」の営業告知かどうかを判定する。"""
-    prompt = """この画像はInstagramストーリーです。画像内に「営業中」という文字が含まれ、
-お店の営業告知になっていますか。次のJSONだけを返してください:
-{"is_open_notice": true または false, "found_text": "画像内で読めた主な文字",
- "description": "主役被写体・構図・背景・配色を日本語で1文", "theme": "訴求テーマを短く"}"""
-    return ask_json(prompt, images=[img], required_keys=("is_open_notice", "description"))
-
-
-def compare_with_past(candidate: Image.Image, past_imgs: list[Image.Image]) -> dict:
-    """候補画像と過去画像を項目別に比べる。2項目以上が実質同一なら類似とする。"""
-    prompt = f"""1枚目が今回の候補画像、2枚目以降({len(past_imgs)}枚)が過去に投稿したストーリーです。
-重ねた文字は無視して、写真部分について過去の各画像と比べてください。
-項目: 主役被写体 / 構図 / 背景 / 配色 / 訴求テーマ
-色や小物だけ違うものは「同じ」と扱ってください。
+def plan_variety(the_date, n: int) -> list[dict]:
+    """見本用: 互いに違うテーマをn個まとめて考える。(1回の呼び出し)"""
+    prompt = f"""横浜・関内のカラオケバー「BAR B」の「営業中！」告知ストーリー用に、
+互いに主役被写体・構図・背景・配色・テーマがまったく違う案を{n}個考えてください。
+背景は写真風で人物の顔なし、画像内に文字なし、中央に主役、上下に暗めの余白。
+一言コピーは日本語で{COPY_MIN_LEN}〜{COPY_MAX_LEN}文字、店名・料金・サービス案内なし。
 次のJSONだけを返してください:
-{{"most_similar_index": 過去画像の番号(2枚目を1とする。なければ0),
-  "same_items": ["最も似ている過去画像と実質同一の項目名"],
-  "reason": "日本語で1文"}}"""
-    return ask_json(prompt, images=[candidate] + past_imgs, required_keys=("most_similar_index", "same_items", "reason"))
+{{"plans": [{{"theme": "", "subject": "", "composition": "", "background": "", "palette": "",
+  "image_prompt": "FLUX向けの英語の画像生成指示", "copy": "一言コピー"}}]}}"""
+    data = ask_json(prompt, required_keys=("plans",))
+    plans = [p for p in data["plans"] if all(p.get(k) for k in ("theme", "image_prompt", "copy"))]
+    if len(plans) < n:
+        raise GeminiError(f"案が{n}個そろいませんでした({len(plans)}個)")
+    return plans[:n]
 
 
-def quality_score(img: Image.Image) -> dict:
-    prompt = """これはカラオケバー「BAR B」の営業告知ストーリーです。次の観点で10点満点で厳しく採点してください:
+def classify_stories(imgs: list[Image.Image]) -> list[dict]:
+    """過去ストーリーが「営業中！」の営業告知かどうかを、まとめて1回で判定する。"""
+    prompt = f"""これは{len(imgs)}枚のInstagramストーリー画像です(1枚目を1番とする)。
+各画像について、画像内に「営業中」という文字があり、お店の営業告知になっているか判定してください。
+次のJSONだけを返してください(画像の枚数と同じ{len(imgs)}件):
+{{"results": [{{"index": 1, "is_open_notice": true または false, "found_text": "読めた主な文字",
+  "description": "主役被写体・構図・背景・配色を日本語で1文", "theme": "訴求テーマを短く"}}]}}"""
+    data = ask_json(prompt, images=imgs, required_keys=("results",), temperature=0.1)
+    res = {int(r.get("index", 0)): r for r in data["results"] if isinstance(r, dict)}
+    if sorted(res) != list(range(1, len(imgs) + 1)):
+        raise GeminiError(f"判定結果の件数が合いません({len(res)}/{len(imgs)})")
+    return [res[i] for i in range(1, len(imgs) + 1)]
+
+
+def review(candidate: Image.Image, past_imgs: list[Image.Image]) -> dict:
+    """類似チェック(項目別)と品質審査を1回でまとめて行う。"""
+    if past_imgs:
+        compare = f"""2枚目以降({len(past_imgs)}枚)は過去に投稿したストーリーです。重ねた文字は無視して、
+写真部分について最も似ている過去画像と比べ、実質同一の項目を挙げてください。
+項目: 主役被写体 / 構図 / 背景 / 配色 / 訴求テーマ (色や小物だけ違うものは「同じ」と扱う)"""
+    else:
+        compare = "過去画像はありません。same_items は空にしてください。"
+    prompt = f"""1枚目は、カラオケバー「BAR B」の今回の営業告知ストーリー候補です。
+{compare}
+
+さらに1枚目を10点満点で厳しく採点してください:
 写真の質感(破綻・不自然な歪み・崩れた物体がないか)、バーらしい世界観、構図、文字の読みやすさ、来店したくなるか。
+
 次のJSONだけを返してください:
-{"score": 整数, "problems": ["問題点(なければ空)"]}"""
-    return ask_json(prompt, images=[img], required_keys=("score",))
+{{"most_similar_index": 最も似ている過去画像の番号(2枚目を1とする。なければ0),
+  "same_items": ["実質同一の項目名"], "similar_reason": "日本語で1文",
+  "score": 整数, "problems": ["問題点(なければ空)"]}}"""
+    return ask_json(prompt, images=[candidate] + past_imgs, required_keys=("same_items", "score"), temperature=0.2)
 
 # ======================================================================
 # 履歴(data/history.json)・各回の記録(data/runs/)・画像の保存と、GitHubへの保存(push)。
@@ -873,25 +958,29 @@ def collect_past(rec, history):
     """比較対象 = 9/14以降の営業中ストーリー(過去分) + このプログラムが作った全画像(積み重ね)。"""
     legacy = history.setdefault("legacy_checked", {})
     unconfirmed = []
-    for url in LEGACY_STORY_URLS:
-        item = legacy.get(url)
-        if item and item.get("is_open") is not None and "fp" in item:
-            continue
+    todo = [u for u in LEGACY_STORY_URLS
+            if not (legacy.get(u) and legacy[u].get("is_open") is not None and "fp" in legacy[u])]
+    fetched = []
+    for url in todo:
         try:
-            img = _download(url)
+            fetched.append((url, _download(url)))
         except Exception as e:  # noqa: BLE001
             unconfirmed.append(url)
             log(rec, "過去ストーリー取得", "画像を取得できず", url=url, error=str(e))
-            continue
+    for i in range(0, len(fetched), 9):  # 9枚ずつまとめて1回で判定(無料枠の節約)
+        chunk = fetched[i:i + 9]
         try:
-            j = is_open_notice(img)
-            is_open, desc, theme = bool(j["is_open_notice"]), j.get("description", ""), j.get("theme", "")
+            results = classify_stories([img for _, img in chunk])
         except Exception as e:  # noqa: BLE001
-            is_open, desc, theme = None, "", ""
-            unconfirmed.append(url)
-            log(rec, "過去ストーリー判定", "判定できず(安全側で比較対象に含める)", url=url, error=str(e))
-        legacy[url] = {"is_open": is_open, "description": desc, "theme": theme,
-                       "fp": fingerprint(img), "thumb": _save_thumb(img, url)}
+            results = [None] * len(chunk)
+            log(rec, "過去ストーリー判定", "判定できず(安全側で比較対象に含める)", error=str(e)[:500])
+        for (url, img), j in zip(chunk, results):
+            if j is None:
+                unconfirmed.append(url)
+            legacy[url] = {"is_open": (bool(j["is_open_notice"]) if j else None),
+                           "description": (j or {}).get("description", ""), "theme": (j or {}).get("theme", ""),
+                           "found_text": (j or {}).get("found_text", ""),
+                           "fp": fingerprint(img), "thumb": _save_thumb(img, url)}
 
     past = []
     for url, item in legacy.items():
@@ -979,21 +1068,21 @@ def produce(rec, today, past, history, seed_base=0, fixed_layout=None, skip_chec
                 continue
             log(rec, "類似チェック(数値)", "PASS", 試行=image_attempts, 比較件数=len(past))
 
-            thumbs = [Image.open(p["thumb"]) for p in past if p.get("thumb") and Path(p["thumb"]).exists()][-40:]
-            if thumbs:
-                cmp = compare_with_past(final, thumbs)
-                same = cmp.get("same_items") or []
-                if len(same) >= 2:
-                    avoid.append(f"過去画像と{'・'.join(same)}が同じだった。{cmp.get('reason', '')}")
-                    log(rec, "類似チェック(項目別)", "FAIL", 試行=image_attempts, 同一項目=same, 理由=cmp.get("reason"))
-                    continue
-                log(rec, "類似チェック(項目別)", "PASS", 試行=image_attempts, 比較枚数=len(thumbs), 同一項目=same)
-
-        q = quality_score(final)
-        if int(q.get("score", 0)) < QUALITY_MIN_SCORE:
-            avoid.append(f"品質不足の指摘: {q.get('problems')}")
-            log(rec, "品質審査", "FAIL", 試行=image_attempts, 点数=q.get("score"), 問題=q.get("problems"))
+        thumbs = [] if skip_checks else [Image.open(p["thumb"]) for p in past
+                                          if p.get("thumb") and Path(p["thumb"]).exists()][-40:]
+        rv = review(final, thumbs)
+        same = rv.get("same_items") or []
+        if not skip_checks:
+            if len(same) >= 2:
+                avoid.append(f"過去画像と{'・'.join(same)}が同じだった。{rv.get('similar_reason', '')}")
+                log(rec, "類似チェック(項目別)", "FAIL", 試行=image_attempts, 同一項目=same, 理由=rv.get("similar_reason"))
+                continue
+            log(rec, "類似チェック(項目別)", "PASS", 試行=image_attempts, 比較枚数=len(thumbs), 同一項目=same)
+        if int(rv.get("score", 0)) < QUALITY_MIN_SCORE:
+            avoid.append(f"品質不足の指摘: {rv.get('problems')}")
+            log(rec, "品質審査", "FAIL", 試行=image_attempts, 点数=rv.get("score"), 問題=rv.get("problems"))
             continue
+        q = rv
         log(rec, "品質審査", "PASS", 試行=image_attempts, 点数=q.get("score"))
         return plan, copy, final, fp, bg_fp, report["style"]
     raise RuntimeError(f"合格する画像を作れませんでした(画像{image_attempts}回・企画{plan_attempts}回)")
@@ -1048,6 +1137,7 @@ def cmd_create():
         TODAY.write_text(json.dumps(today_json, ensure_ascii=False, indent=1), encoding="utf-8")
         log(rec, "画像の保存と公開URL照合", "完了", 公開URL=url, sha256=sha[:16])
         rec["result"] = "画像作成完了(投稿待ち)"
+        log(rec, "Geminiの使用回数", "記録", 回数=CALLS)
         print(f"\n今日の画像: {url}\n投稿予定: {date_text(today)} 15:00(Claudeの定時タスクが予約します)\n")
         return 0
     except Exception as e:  # noqa: BLE001
@@ -1064,25 +1154,35 @@ def cmd_create():
 
 
 def cmd_preview():
-    """デザイン見本: レイアウトを1つずつ変えて8枚作る。履歴・投稿には使わない。"""
+    """デザイン見本: 背景4枚 × レイアウト2種 = 8枚。Geminiは1回だけ使う。履歴・投稿には使わない。"""
     now = datetime.now(JST)
     today = now.date()
     rec = {"date": today.isoformat(), "kind": "見本"}
-    history = load_history()
     out = Path(MEDIA_DIR) / "preview"
     out.mkdir(parents=True, exist_ok=True)
-    made = []
-    for i, layout in enumerate(LAYOUTS):
+    made, results = [], []
+    plans = plan_variety(today, 4)
+    for i, plan in enumerate(plans):
         try:
-            _, copy, final, *_ = produce(rec, today, [], history, seed_base=100 + i * 7, fixed_layout=layout, skip_checks=True)
-            p = out / f"{i + 1}_{layout}.png"
+            bg = generate(plan["image_prompt"])
+        except Exception as e:  # noqa: BLE001
+            log(rec, "見本の背景生成", "FAIL", 案=plan["theme"], error=str(e)[:300])
+            continue
+        for k, layout in enumerate(LAYOUTS[i * 2:i * 2 + 2]):
+            style = choose_style(bg, today, [], seed=1000 + i * 10 + k)
+            style["layout"] = layout
+            copy = plan["copy"].strip()
+            final, report = compose(bg, today, copy, style)
+            errs = check_composition(report, today, copy)
+            p = out / f"{i * 2 + k + 1}_{layout}.png"
             final.save(p, optimize=True)
             made.append(p.as_posix())
-        except Exception as e:  # noqa: BLE001
-            log(rec, "見本", "FAIL", レイアウト=layout, error=str(e))
+            results.append({"file": p.name, "theme": plan["theme"], "copy": copy, "design": report["style"],
+                            "check": errs or "合格"})
+            log(rec, "見本", "作成", ファイル=p.name, 照合=errs or "合格")
+    (out / "result.json").write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
     commit_and_push(f"見本 {today}", [MEDIA_DIR])
-    for p in made:
-        print(public_url(Path(p)))
+    print(f"Geminiの使用回数: {CALLS}")
     return 0 if made else 1
 
 
@@ -1091,7 +1191,8 @@ def cmd_selftest():
     now = datetime.now(JST)
     for name, fn in [
         ("営業日判定", lambda: check(now.date())),
-        ("Gemini", lambda: ask_json('{"ok": true} とだけ返してください', required_keys=("ok",))),
+        ("Gemini(使えるモデル)", lambda: models()[:6]),
+        ("Gemini", lambda: ask_json('{"ok": true} とだけ返してください', required_keys=("ok",)).get("_model")),
         ("Cloudflare 画像生成", lambda: generate("a quiet cocktail glass on a bar counter, night").size),
         ("過去ストーリー画像の取得", lambda: _download(LEGACY_STORY_URLS[-1]).size),
     ]:
